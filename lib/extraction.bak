@@ -1,0 +1,126 @@
+import 'dart:io';
+import 'dart:convert';
+import 'dart:typed_data';
+import 'package:tflite_flutter/tflite_flutter.dart';
+import 'package:image/image.dart' as img;
+
+class MeterReader {
+  final Interpreter _interpreter;
+  final List<String> classNames;
+  final double yAdjustment;
+  final double confThreshold;
+
+  MeterReader._(
+      this._interpreter, this.classNames, this.yAdjustment, this.confThreshold);
+
+  static Future<MeterReader> create(String modelPath, List<String> classNames,
+      {double yAdjustment = 20.0, double confThreshold = 0.5}) async {
+    final interpreter = await Interpreter.fromAsset(modelPath);
+    return MeterReader._(interpreter, classNames, yAdjustment, confThreshold);
+  }
+
+  img.Image preprocessImage(Uint8List imageBytes, int height, int width) {
+    img.Image image = img.decodeImage(imageBytes)!;
+    img.Image resizedImage =
+        img.copyResize(image, width: width, height: height);
+    return resizedImage;
+  }
+
+  Float32List imageToTensor(img.Image image, int height, int width) {
+    var convertedBytes = Float32List(1 * height * width * 3);
+    var buffer = Float32List.view(convertedBytes.buffer);
+    int pixelIndex = 0;
+
+    for (int y = 0; y < height; y++) {
+      for (int x = 0; x < width; x++) {
+        var pixel = image.getPixel(x, y);
+        buffer[pixelIndex++] = img.getRed(pixel) / 255.0;
+        buffer[pixelIndex++] = img.getGreen(pixel) / 255.0;
+        buffer[pixelIndex++] = img.getBlue(pixel) / 255.0;
+      }
+    }
+    return convertedBytes;
+  }
+
+  Future<Map<String, dynamic>> extractDigits(File imageFile,
+      {bool returnAnnotatedImg = false}) async {
+    Uint8List imageBytes = await imageFile.readAsBytes();
+    img.Image? inputImage = img.decodeImage(imageBytes);
+    if (inputImage == null)
+      throw Exception("Failed to decode the input image.");
+
+    final inputShape = _interpreter.getInputTensor(0).shape;
+    final width = inputShape[1];
+    final height = inputShape[2];
+
+    img.Image processedImage = preprocessImage(imageBytes, height, width);
+    Float32List inputTensor = imageToTensor(processedImage, height, width);
+    var input = inputTensor.buffer.asUint8List();
+
+    // Prepare input and output tensors
+    final outputShape = _interpreter.getOutputTensor(0).shape;
+    List<List<List<double>>> boxes = List.generate(
+        outputShape[0],
+        (_) => List.generate(
+            outputShape[1], (_) => List.filled(outputShape[2], 0.0)));
+
+    _interpreter.run(input, boxes);
+
+    List<Map<String, dynamic>> detections = [];
+    for (var box in boxes[0]) {
+      if (box[4] >= confThreshold) {
+        detections.add({
+          'xCenter': box[0],
+          'yCenter': box[1],
+          'width': box[2],
+          'height': box[3],
+          'confidence': box[4],
+          'class': box[5].toInt(),
+        });
+      }
+    }
+
+    // Filter detections based on y-axis and sort them
+    double avgY = detections.fold(0.0, (sum, det) => sum + det['yCenter']) /
+        detections.length;
+
+    final filteredBoxes = detections.where((box) {
+      return (avgY + yAdjustment >= box['yCenter']!) &&
+          (avgY - yAdjustment <= box['yCenter']!);
+    }).toList()
+      ..sort((a, b) => a['xCenter'].compareTo(b['xCenter']));
+
+    String digitSequence = '';
+    for (var box in filteredBoxes) {
+      digitSequence += classNames[box['class']];
+    }
+
+    String? annotatedImage;
+    if (returnAnnotatedImg) {
+      annotatedImage = _annotateImage(inputImage, filteredBoxes);
+    }
+
+    return {'digits': digitSequence, 'annotatedImage': annotatedImage};
+  }
+
+  String _annotateImage(img.Image image, List<Map<String, dynamic>> boxes) {
+    for (var box in boxes) {
+      final x = (box['xCenter']! - box['width']! / 2) * image.width;
+      final y = (box['yCenter']! - box['height']! / 2) * image.height;
+      final w = box['width']! * image.width;
+      final h = box['height']! * image.height;
+
+      img.drawRect(image, x.toInt(), y.toInt(), (x + w).toInt(),
+          (y + h).toInt(), img.getColor(255, 0, 0));
+      img.drawString(image, img.arial_24, x.toInt(), y.toInt() - 12,
+          classNames[box['class']],
+          color: img.getColor(255, 255, 0));
+    }
+
+    return base64Encode(img.encodeJpg(image));
+  }
+
+  void close() {
+    _interpreter.close();
+  }
+}
