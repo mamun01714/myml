@@ -1,6 +1,6 @@
-description: Ultralytics best model trained on /content/gdrive/MyDrive/Colab Notebooks/MeterProject/YOLODataset/dataset.yaml
+description: Ultralytics best model trained on ./YOLODataset/dataset.yaml
 author: Ultralytics
-date: '2024-12-23T16:32:02.195196'
+date: '2025-12-02T14:01:06.330824'
 version: 8.3.28
 license: AGPL-3.0 License (https://ultralytics.com/license)
 docs: https://docs.ultralytics.com
@@ -11,15 +11,15 @@ imgsz:
 - 480
 - 480
 names:
-  0: '*'
-  1: '0'
-  2: '8'
-  3: '9'
-  4: '7'
+  0: '0'
+  1: '6'
+  2: '3'
+  3: '8'
+  4: '1'
   5: '2'
-  6: .
-  7: '1'
-  8: '3'
-  9: '6'
-  10: '4'
-  11: '5'
+  6: '7'
+  7: '4'
+  8: '5'
+  9: '9'
+  10: '*'
+  11: .

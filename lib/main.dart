@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:typed_data';
+import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:image/image.dart' as img;
@@ -8,6 +9,7 @@ import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter_vision/flutter_vision.dart';
 import 'package:camera/camera.dart';
+import 'classification.dart'; // Your separate ClassificationModel
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -42,41 +44,65 @@ class _ImageClassificationScreenState extends State<ImageClassificationScreen> {
   String _reading = '';
   List<Map<String, dynamic>> _detectedBoxes = [];
 
-  late Interpreter _interpreter;
-  late List<String> _labels;
   late FlutterVision _vision;
   late CameraController _cameraController;
   late Future<void> _initializeControllerFuture;
 
-  // ignore: prefer_final_fields
+  ClassificationModel classificationModel = ClassificationModel();
+
   int _height = 160, _width = 160;
   String? _imagePath;
   bool _isCameraInitialized = false;
 
-  var result = List.filled(1 * 4, 0).reshape([1, 4]);
+  int _imageActualWidth = 480;
+  int _imageActualHeight = 320;
 
   final ImagePicker _picker = ImagePicker();
 
   @override
   void initState() {
     super.initState();
-    _loadModel();
-    _loadLabels();
+    _initializeClassifier();
     _initializeCamera();
+  }
+
+  Future<void> _initializeClassifier() async {
+    await classificationModel.loadModel();
+    await classificationModel.loadLabels();
+    _vision = FlutterVision();
+    try {
+      await _vision.loadYoloModel(
+        labels: 'assets/ylabels.txt',
+        modelPath: 'assets/best_float32.tflite',
+        modelVersion: "yolov8",
+        quantization: false,
+        numThreads: 2,
+        useGpu: true,
+      );
+      if (kDebugMode) print('Yolo Model Loaded!');
+    } catch (e) {
+      if (kDebugMode) print('Yolo load failed: $e');
+    }
   }
 
   @override
   void dispose() {
     super.dispose();
-    _interpreter.close();
-    _vision.closeYoloModel();
-    _cameraController.dispose();
+    try {
+      classificationModel.dispose();
+    } catch (e) {}
+    try {
+      _vision.closeYoloModel();
+    } catch (e) {}
+    try {
+      _cameraController.dispose();
+    } catch (e) {}
   }
 
   _initializeCamera() {
     _cameraController = CameraController(
       widget.cameras.first,
-      ResolutionPreset.high, // Use a higher resolution for better quality
+      ResolutionPreset.high,
     );
     _initializeControllerFuture = _cameraController.initialize().then((_) {
       setState(() {
@@ -85,173 +111,119 @@ class _ImageClassificationScreenState extends State<ImageClassificationScreen> {
         _classification = '';
         _reading = '';
       });
+    }).catchError((e) {
+      if (kDebugMode) print("Camera init error: $e");
     });
   }
 
-  _loadModel() async {
-    _interpreter = await Interpreter.fromAsset('assets/model.tflite');
-    if (kDebugMode) {
-      print('Model Loaded!');
-    }
+  Future<void> _classifyImage(String? imgPath) async {
+    if (imgPath == null) return;
 
-    // Load and preprocess the image
-    _vision = FlutterVision();
-    await _vision.loadYoloModel(
-        labels: 'assets/ylabels.txt',
-        modelPath: 'assets/best_float32.tflite',
-        modelVersion: "yolov8",
-        quantization: false,
-        numThreads: 1,
-        useGpu: false);
-
-    if (kDebugMode) print('Yolo Model Loaded!');
-  }
-
-  _loadLabels() async {
-    final String labelsData = await rootBundle.loadString('assets/labels.txt');
-    _labels = labelsData.split('\n');
-  }
-
-  Future<List<String>> loadLabels(String path) async {
-    final String labelsData = await rootBundle.loadString(path);
-    return labelsData.split('\n');
-  }
-
-  img.Image preprocessImage(Uint8List imageBytes, int height, int width) {
-    img.Image image = img.decodeImage(imageBytes)!;
-    img.Image resizedImage =
-    img.copyResize(image, width: width, height: height);
-    return resizedImage;
-  }
-
-  Float32List imageToTensor(img.Image image, int height, int width) {
-    var convertedBytes =
-    Float32List(1 * height * width * 3); // Example input size
-    var buffer = Float32List.view(convertedBytes.buffer);
-    int pixelIndex = 0;
-
-    for (int y = 0; y < height; y++) {
-      for (int x = 0; x < width; x++) {
-        var pixel = image.getPixel(x, y);
-        buffer[pixelIndex++] = img.getRed(pixel) / 1.0;
-        buffer[pixelIndex++] = img.getGreen(pixel) / 1.0;
-        buffer[pixelIndex++] = img.getBlue(pixel) / 1.0;
-      }
-    }
-    return convertedBytes;
-  }
-
-  _detect(Uint8List imageBytes) async {
-    var confThreshold = 0.3;
-    var y_adjustment = 20;
-
-    final result = await _vision.yoloOnImage(
-        bytesList: imageBytes,
-        imageHeight: 320,
-        imageWidth: 480,
-        iouThreshold: 0.2,
-        confThreshold: confThreshold,
-        classThreshold: 0.3);
-
-    if (result.isEmpty) return;
-
-    Map<int, String> digit = {};
-
-    var y0 = result.map((e) => e['box'][1]).reduce((a, b) => a + b) / result.length;
-    var y1 = result.map((e) => e['box'][3]).reduce((a, b) => a + b) / result.length;
-    var y_avg = (y0 + y1) / 2.0;
-
-    // Group by box[0]
-    var grouped = <int, List<Map<String, dynamic>>>{};
-    for (var result in result) {
-      int key = (result['box'][0]).toInt();
-      if (!grouped.containsKey(key)) {
-        grouped[key] = [];
-      }
-      grouped[key]!.add(result);
-    }
-
-    // Find the entry with the highest box[4] in each group
-    var highestConfidenceEntries = grouped.map((key, value) {
-      var highest = value.reduce((a, b) => a['box'][4] > b['box'][4] ? a : b);
-      return MapEntry(key, highest);
-    });
-
-    // Process the results
-    _detectedBoxes.clear();
-    List<Map<String, dynamic>> boxes = [];
-
-    for (var r in highestConfidenceEntries.values.toList()) {
-      if ((((r['box'][1] + r['box'][3]) / 2) - y_avg).abs() <= y_adjustment) {
-        digit[(r['box'][0]).toInt()] = r['tag'];
-        boxes.add(r);
-      }
-    }
-
-    print(digit);
-
-    var sortedEntries = digit.entries.toList();
-    // Sort the list by keys
-    sortedEntries.sort((a, b) => a.key.compareTo(b.key));
-
-    // Convert the digits to a string
-    final digitsStr = sortedEntries.map((e) => e.value).join('');
-
-    print(digitsStr);
-
-    setState(() {
-      _reading = digitsStr;
-      _detectedBoxes = boxes;
-    });
-  }
-
-  _classifyImage(String? imgPath) async {
-    if (imgPath == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("Please select an image first")),
-      );
+    if (classificationModel.labels.isEmpty) {
+      if (kDebugMode) print("Labels not loaded yet!");
       return;
     }
 
-    // Load the image as bytes
-    File imageFile = File(imgPath);
-    Uint8List imageBytes = await imageFile.readAsBytes();
+    await classificationModel.classifyImage(imgPath);
 
-    // Load and preprocess the image
-    img.Image processedImage =
-    preprocessImage(imageBytes, _height, _width); // Example input size
-    Float32List inputTensor = imageToTensor(processedImage, _height, _width);
-    var input = inputTensor.buffer.asUint8List();
-
-    _interpreter.run(input, result);
-
-    if (kDebugMode) {
-      print(result);
-    }
-    if (kDebugMode) {
-      print(_labels);
-    }
-
-    var output = result[0];
-    int maxIndex = 0;
-    double maxValue = output[0];
-
-    for (int i = 1; i < output.length; i++) {
-      if (output[i] > maxValue) {
-        maxValue = output[i];
-        maxIndex = i;
-      }
-    }
-
-    String predictedLabel = _labels[maxIndex];
-
-    if (predictedLabel.trimLeft().trimRight() == 'Meter') {
-      _detect(imageBytes);
+    if (classificationModel.classification.trim() == 'Meter') {
+      File imageFile = File(imgPath);
+      Uint8List imageBytes = await imageFile.readAsBytes();
+      await _detect(imageBytes);
     }
 
     setState(() {
-      _classification = predictedLabel;
+      _classification = classificationModel.classification;
     });
+  }
+
+  _detect(Uint8List imageBytes) async {
+    final double confThreshold = 0.2;
+    if (_vision == null) return;
+
+    try {
+      final decoded = img.decodeImage(imageBytes)!;
+      final int imgW = decoded.width;
+      final int imgH = decoded.height;
+
+      final result = await _vision.yoloOnImage(
+        bytesList: imageBytes,
+        imageHeight: imgH,
+        imageWidth: imgW,
+        confThreshold: confThreshold,
+        classThreshold: 0.2,
+        iouThreshold: 0.5,
+      );
+
+      if (result.isEmpty) return;
+
+      List<double> centerY = result
+          .map((r) => (((r['box'][1] as num).toDouble() + (r['box'][3] as num).toDouble()) / 2.0))
+          .cast<double>()
+          .toList();
+
+      double rowY = centerY.reduce((a, b) => a + b) / centerY.length;
+      final double tol = max(12.0, 0.03 * imgH);
+
+      List<Map<String, dynamic>> rowDetections = result.where((r) {
+        final cy = (((r['box'][1] as num).toDouble() + (r['box'][3] as num).toDouble()) / 2.0);
+        return (cy - rowY).abs() <= tol;
+      }).cast<Map<String, dynamic>>().toList();
+
+      if (rowDetections.isEmpty) return;
+
+      Map<int, Map<String, dynamic>> bestPerColumn = {};
+      for (var r in rowDetections) {
+        final double cx = (((r['box'][0] as num).toDouble() + (r['box'][2] as num).toDouble()) / 2.0);
+        final int key = cx.round();
+        final double conf = (r['box'].length > 4) ? (r['box'][4] as num).toDouble() : 0.0;
+
+        if (!bestPerColumn.containsKey(key) ||
+            conf > ((bestPerColumn[key]!['box'][4] as num).toDouble())) {
+          bestPerColumn[key] = r;
+        }
+      }
+
+      List<Map<String, dynamic>> sorted = bestPerColumn.values.toList()
+        ..sort((a, b) {
+          double ax = (((a['box'][0] as num).toDouble() + (a['box'][2] as num).toDouble()) / 2.0);
+          double bx = (((b['box'][0] as num).toDouble() + (b['box'][2] as num).toDouble()) / 2.0);
+          return ax.compareTo(bx);
+        });
+
+      List<Map<String, dynamic>> finalBoxes = [];
+      for (var r in sorted) {
+        final b = r['box'];
+        final double x0 = (b[0] as num).toDouble();
+        final double y0 = (b[1] as num).toDouble();
+        final double x1 = (b[2] as num).toDouble();
+        final double y1 = (b[3] as num).toDouble();
+        final String tag = r['tag']?.toString() ?? '';
+        final double conf = (b.length > 4) ? (b[4] as num).toDouble() : 0.0;
+
+        finalBoxes.add({
+          'box': [x0, y0, x1, y1],
+          'tag': tag,
+          'conf': conf,
+        });
+      }
+
+      setState(() {
+        _reading = finalBoxes.map((b) => b['tag']).join();
+        _detectedBoxes = finalBoxes;
+        _imageActualWidth = imgW;
+        _imageActualHeight = imgH;
+      });
+
+      if (kDebugMode) {
+        print('Detected: $_reading (img ${imgW}x${imgH}, boxes ${_detectedBoxes.length})');
+      }
+    } catch (e, st) {
+      if (kDebugMode) {
+        print('Error in _detect: $e');
+        print(st);
+      }
+    }
   }
 
   Future<void> _pickImage() async {
@@ -259,7 +231,7 @@ class _ImageClassificationScreenState extends State<ImageClassificationScreen> {
     if (image != null) {
       setState(() {
         _imagePath = image.path;
-        _classification = ""; // Reset classification
+        _classification = "";
         _reading = "";
         _detectedBoxes.clear();
       });
@@ -270,81 +242,70 @@ class _ImageClassificationScreenState extends State<ImageClassificationScreen> {
     try {
       await _initializeControllerFuture;
       final file = await _cameraController.takePicture();
-
       setState(() {
         _imagePath = file.path;
-        _classification = ""; // Reset classification
+        _classification = "";
         _reading = "";
         _detectedBoxes.clear();
       });
     } catch (e) {
-      print(e);
+      if (kDebugMode) print('Capture error: $e');
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: Text('DPDC Meter Reading'),
-      ),
+      appBar: AppBar(title: Text('DPDC Meter Reading')),
       body: SingleChildScrollView(
         child: Center(
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              SizedBox(height: 50,),
+              SizedBox(height: 50),
               Row(
                 mainAxisAlignment: MainAxisAlignment.center,
-                children: <Widget>[
-                  ElevatedButton(
-                    onPressed: _pickImage,
-                    child: Text('Gallery'),
-                  ),
+                children: [
+                  ElevatedButton(onPressed: _pickImage, child: Text('Gallery')),
                   SizedBox(width: 10),
-                  ElevatedButton(
-                    onPressed: _initializeCamera,
-                    child: Text('Camera'),
-                  ),
+                  ElevatedButton(onPressed: _initializeCamera, child: Text('Camera')),
                   SizedBox(width: 10),
-                  ElevatedButton(
-                    onPressed: () async {
-                      await _captureImage();
-                    },
-                    child: Text('Capture'),
-                  ),
+                  ElevatedButton(onPressed: _captureImage, child: Text('Capture')),
                 ],
               ),
               SizedBox(height: 20),
               if (_imagePath != null)
                 Container(
                   width: 480,
-                  height: 255,
-                  decoration: BoxDecoration(
-                    border: Border.all(color: Colors.grey),
-                  ),
-                  child: Stack(
-                    children: [
-                      Image.file(
-                        File(_imagePath!),
-                        fit: BoxFit.cover, // Adjust this to BoxFit.contain if needed
-                        width: double.infinity,
-                        height: double.infinity,
-                      ),
-                      CustomPaint(
-                        size: Size(480, 320),
-                        painter: BoxPainter(_detectedBoxes, 480, 320),
-                      ),
-                    ],
-                  ),
+                  child: LayoutBuilder(builder: (context, constraints) {
+                    final displayW = constraints.maxWidth;
+                    final aspect = (_imageActualWidth > 0 && _imageActualHeight > 0)
+                        ? _imageActualWidth / _imageActualHeight
+                        : 480 / 320;
+                    final displayH = displayW / aspect;
+                    return SizedBox(
+                      width: displayW,
+                      height: displayH,
+                      child: Stack(children: [
+                        Positioned.fill(child: Image.file(File(_imagePath!), fit: BoxFit.contain)),
+                        CustomPaint(
+                          size: Size(displayW, displayH),
+                          painter: BoxPainter(
+                              _detectedBoxes,
+                              _imageActualWidth.toDouble(),
+                              _imageActualHeight.toDouble(),
+                              displayW,
+                              displayH),
+                        ),
+                      ]),
+                    );
+                  }),
                 )
               else if (_isCameraInitialized)
                 Container(
                   width: 480,
                   height: 255,
-                  decoration: BoxDecoration(
-                    border: Border.all(color: Colors.grey),
-                  ),
+                  decoration: BoxDecoration(border: Border.all(color: Colors.grey)),
                   child: ClipRect(
                     child: OverflowBox(
                       alignment: Alignment.center,
@@ -363,76 +324,59 @@ class _ImageClassificationScreenState extends State<ImageClassificationScreen> {
                 Container(
                   height: 320,
                   width: 480,
-                  decoration: BoxDecoration(
-                    border: Border.all(color: Colors.grey),
-                  ),
-                  child: Center(
-                    child: Text("No image selected"),
-                  ),
+                  decoration: BoxDecoration(border: Border.all(color: Colors.grey)),
+                  child: Center(child: Text("No image selected")),
                 ),
               SizedBox(height: 20),
               ElevatedButton(
-                onPressed: () async {
-                  await _classifyImage(_imagePath);
-                },
+                onPressed: () => _classifyImage(_imagePath),
                 child: Text('Classify Image'),
               ),
               SizedBox(height: 30),
-              Text('Classified as: $_classification', style: TextStyle(fontSize: 18, color: Colors.red, fontWeight: FontWeight.bold)),
-              Text('Reading: $_reading', style: TextStyle(fontSize: 18, color: Colors.red, fontWeight: FontWeight.bold)),
+              Text('Classified as: $_classification',
+                  style: TextStyle(fontSize: 18, color: Colors.red, fontWeight: FontWeight.bold)),
+              Text('Reading: $_reading',
+                  style: TextStyle(fontSize: 18, color: Colors.red, fontWeight: FontWeight.bold)),
             ],
           ),
         ),
       ),
     );
   }
-
-
-
 }
 
+// ---------- BoxPainter ----------
 class BoxPainter extends CustomPainter {
   final List<Map<String, dynamic>> boxes;
-  final double imageWidth;
-  final double imageHeight;
+  final double imageWidth, imageHeight, displayWidth, displayHeight;
 
-  BoxPainter(this.boxes, this.imageWidth, this.imageHeight);
+  BoxPainter(this.boxes, this.imageWidth, this.imageHeight, this.displayWidth, this.displayHeight);
 
   @override
   void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..color = Colors.red
-      ..strokeWidth = 2.0
-      ..style = PaintingStyle.stroke;
-
-    final textPainter = TextPainter(
-      textAlign: TextAlign.left,
-      textDirection: TextDirection.ltr,
-    );
+    final paint = Paint()..color = Colors.red..strokeWidth = 2.0..style = PaintingStyle.stroke;
+    final textPainter = TextPainter(textAlign: TextAlign.left, textDirection: TextDirection.ltr);
+    if (imageWidth <= 0 || imageHeight <= 0) return;
+    final scaleX = displayWidth / imageWidth;
+    final scaleY = displayHeight / imageHeight;
 
     for (var box in boxes) {
-      final left = box['box'][0].toDouble() * size.width / imageWidth;
-      final top = box['box'][1].toDouble() * size.height / imageHeight;
-      final right = box['box'][2].toDouble() * size.width / imageWidth;
-      final bottom = box['box'][3].toDouble() * size.height / imageHeight;
+      final b = box['box'];
+      final x0 = (b[0] as num).toDouble() * scaleX;
+      final y0 = (b[1] as num).toDouble() * scaleY;
+      final x1 = (b[2] as num).toDouble() * scaleX;
+      final y1 = (b[3] as num).toDouble() * scaleY;
 
-      final rect = Rect.fromLTRB(left, top, right, bottom);
-      canvas.drawRect(rect, paint);
+      canvas.drawRect(Rect.fromLTRB(x0, y0, x1, y1), paint);
 
-      // Draw the tag above the box
-      final tag = box['tag'];
-      final textSpan = TextSpan(
-        text: tag,
-        style: TextStyle(color: Colors.red, fontSize: 12),
-      );
+      final tag = box['tag']?.toString() ?? '';
+      final textSpan = TextSpan(text: tag, style: TextStyle(color: Colors.red, fontSize: 12));
       textPainter.text = textSpan;
       textPainter.layout();
-      textPainter.paint(canvas, Offset(left, top - textPainter.height));
+      textPainter.paint(canvas, Offset(x0, max(0.0, y0 - textPainter.height - 2)));
     }
   }
 
   @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) {
-    return true;
-  }
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
 }
