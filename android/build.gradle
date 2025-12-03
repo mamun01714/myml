@@ -1,3 +1,17 @@
+
+// >>> paste right after buildscript { ... } in android/build.gradle (top-level)
+subprojects {
+    project.configurations.all {
+        resolutionStrategy {
+            // byte-buddy version compatible with JDK 17
+            force "net.bytebuddy:byte-buddy:1.12.23"
+            // bouncycastle version compatible with JDK 17
+            force "org.bouncycastle:bcprov-jdk18on:1.74"
+        }
+    }
+}
+
+
 allprojects {
     repositories {
         google()
@@ -8,6 +22,8 @@ allprojects {
 
 
 rootProject.buildDir = "../build"
+
+
 subprojects {
     project.buildDir = "${rootProject.buildDir}/${project.name}"
 }
@@ -27,6 +43,8 @@ subprojects {
 subprojects {
     project.evaluationDependsOn(':app')
 }
+
+
 
 tasks.register("clean", Delete) {
     delete rootProject.buildDir
